@@ -1,5 +1,5 @@
-browsergym-core==0.13.3
-browsergym-webarena
-libvisualwebarena==0.0.15
+-e ../core
+-e ../webarena
+-e ../../../libvisualwebarena
 requests
 torch

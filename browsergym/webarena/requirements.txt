@@ -1,2 +1,2 @@
-browsergym-core==0.13.3
-libwebarena @ file:../../../libwebarena
+-e ../core
+-e ../../../libwebarena
