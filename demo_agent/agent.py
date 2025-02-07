@@ -4,13 +4,24 @@ import io
 import logging
 
 import numpy as np
-import openai
+
 from PIL import Image
 
 from browsergym.core.action.highlevel import HighLevelActionSet
 from browsergym.core.action.python import PythonActionSet
 from browsergym.experiments import AbstractAgentArgs, Agent
 from browsergym.utils.obs import flatten_axtree_to_str, flatten_dom_to_str, prune_html
+
+from gen_ai_hub.proxy import GenAIHubProxyClient
+
+
+from .messages_helper import text_message
+from .prompts import CHAT_MESSAGES_HEADER, GET_ACTION_INSTRUCTIONS, GOALS_OBJECT_HEADER, NEXT_ACTION_INSTRUCTION_TEXT, action_space_text, axtree_info_text, chat_message_user_msg_text, last_action_error_text, open_tab_info_text, page_dom_text
+
+
+gen_ai_hub_proxy_client = GenAIHubProxyClient()
+
+from gen_ai_hub.proxy.native.openai import OpenAI
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +78,7 @@ class DemoAgent(Agent):
         if not (use_html or use_axtree):
             raise ValueError(f"Either use_html or use_axtree must be set to True.")
 
-        self.openai_client = openai.OpenAI()
+        self.openai_client = OpenAI(proxy_client=gen_ai_hub_proxy_client)
 
         self.action_set = HighLevelActionSet(
             subsets=["chat", "tab", "nav", "bid", "infeas"],  # define a subset of the action space
@@ -86,42 +97,12 @@ class DemoAgent(Agent):
         user_msgs = []
 
         if self.chat_mode:
-            system_msgs.append(
-                {
-                    "type": "text",
-                    "text": f"""\
-# Instructions
-
-You are a UI Assistant, your goal is to help the user perform tasks using a web browser. You can
-communicate with the user via a chat, to which the user gives you instructions and to which you
-can send back messages. You have access to a web browser that both you and the user can see,
-and with which only you can interact via specific commands.
-
-Review the instructions from the user, the current state of the page and all other information
-to find the best possible next action to accomplish your goal. Your answer will be interpreted
-and executed by a program, make sure to follow the formatting instructions.
-""",
-                }
-            )
+            system_msgs.append(text_message(GET_ACTION_INSTRUCTIONS))
             # append chat messages
-            user_msgs.append(
-                {
-                    "type": "text",
-                    "text": f"""\
-# Chat Messages
-""",
-                }
-            )
+            user_msgs.append(text_message(CHAT_MESSAGES_HEADER))
             for msg in obs["chat_messages"]:
                 if msg["role"] in ("user", "assistant", "infeasible"):
-                    user_msgs.append(
-                        {
-                            "type": "text",
-                            "text": f"""\
-- [{msg['role']}] {msg['message']}
-""",
-                        }
-                    )
+                    user_msgs.append(text_message(chat_message_user_msg_text(msg)))
                 elif msg["role"] == "user_image":
                     user_msgs.append({"type": "image_url", "image_url": msg["message"]})
                 else:
@@ -129,90 +110,32 @@ and executed by a program, make sure to follow the formatting instructions.
 
         else:
             assert obs["goal_object"], "The goal is missing."
-            system_msgs.append(
-                {
-                    "type": "text",
-                    "text": f"""\
-# Instructions
-
-Review the current state of the page and all other information to find the best
-possible next action to accomplish your goal. Your answer will be interpreted
-and executed by a program, make sure to follow the formatting instructions.
-""",
-                }
-            )
+            system_msgs.append(text_message(GOALS_OBJECT_HEADER))
             # append goal
-            user_msgs.append(
-                {
-                    "type": "text",
-                    "text": f"""\
-# Goal
-""",
-                }
-            )
+            user_msgs.append(text_message("\n# Goal"))
             # goal_object is directly presented as a list of openai-style messages
             user_msgs.extend(obs["goal_object"])
 
         # append url of all open tabs
-        user_msgs.append(
-            {
-                "type": "text",
-                "text": f"""\
-# Currently open tabs
-""",
-            }
-        )
+        user_msgs.append(text_message("\n# Currently open tabs"))
+
         for page_index, (page_url, page_title) in enumerate(
             zip(obs["open_pages_urls"], obs["open_pages_titles"])
         ):
-            user_msgs.append(
-                {
-                    "type": "text",
-                    "text": f"""\
-Tab {page_index}{" (active tab)" if page_index == obs["active_page_index"] else ""}
-  Title: {page_title}
-  URL: {page_url}
-""",
-                }
-            )
+            is_active = page_index == obs["active_page_index"]
+            user_msgs.append(text_message(open_tab_info_text(page_index, page_url, page_title, is_active)))
 
         # append page AXTree (if asked)
         if self.use_axtree:
-            user_msgs.append(
-                {
-                    "type": "text",
-                    "text": f"""\
-# Current page Accessibility Tree
+            user_msgs.append(text_message(axtree_info_text(obs["axtree_txt"])))
 
-{obs["axtree_txt"]}
-
-""",
-                }
-            )
         # append page HTML (if asked)
         if self.use_html:
-            user_msgs.append(
-                {
-                    "type": "text",
-                    "text": f"""\
-# Current page DOM
-
-{obs["pruned_html"]}
-
-""",
-                }
-            )
+            user_msgs.append(text_message(page_dom_text(obs["pruned_html"])))
 
         # append page screenshot (if asked)
         if self.use_screenshot:
-            user_msgs.append(
-                {
-                    "type": "text",
-                    "text": """\
-# Current page Screenshot
-""",
-                }
-            )
+            user_msgs.append(text_message("\n# Current page Screenshot"))
             user_msgs.append(
                 {
                     "type": "image_url",
@@ -224,73 +147,19 @@ Tab {page_index}{" (active tab)" if page_index == obs["active_page_index"] else 
             )
 
         # append action space description
-        user_msgs.append(
-            {
-                "type": "text",
-                "text": f"""\
-# Action Space
-
-{self.action_set.describe(with_long_description=False, with_examples=True)}
-
-Here are examples of actions with chain-of-thought reasoning:
-
-I now need to click on the Submit button to send the form. I will use the click action on the button, which has bid 12.
-```click("12")```
-
-I found the information requested by the user, I will send it to the chat.
-```send_msg_to_user("The price for a 15\\" laptop is 1499 USD.")```
-
-""",
-            }
-        )
+        user_msgs.append(text_message(action_space_text(self.action_set)))
 
         # append past actions (and last error message) if any
         if self.action_history:
-            user_msgs.append(
-                {
-                    "type": "text",
-                    "text": f"""\
-# History of past actions
-""",
-                }
-            )
-            user_msgs.extend(
-                [
-                    {
-                        "type": "text",
-                        "text": f"""\
-
-{action}
-""",
-                    }
-                    for action in self.action_history
-                ]
-            )
+            user_msgs.append(text_message("\n# History of past actions"))
+            action_history_array = [ text_message(f"\n\n{action}") for action in self.action_history ]
+            user_msgs.extend(action_history_array)
 
             if obs["last_action_error"]:
-                user_msgs.append(
-                    {
-                        "type": "text",
-                        "text": f"""\
-# Error message from last action
-
-{obs["last_action_error"]}
-
-""",
-                    }
-                )
+                user_msgs.append(text_message(last_action_error_text(obs["last_action_error"])))
 
         # ask for the next action
-        user_msgs.append(
-            {
-                "type": "text",
-                "text": f"""\
-# Next action
-
-You will now think step by step and produce your next best action. Reflect on your past actions, any resulting error message, and the current state of the page before deciding on your next action.
-""",
-            }
-        )
+        user_msgs.append(text_message(NEXT_ACTION_INSTRUCTION_TEXT))
 
         prompt_text_strings = []
         for message in system_msgs + user_msgs:

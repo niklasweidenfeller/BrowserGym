@@ -1,3 +1,7 @@
+ENV_FILE = "./demo_agent/.env"
+from dotenv import load_dotenv
+load_dotenv(ENV_FILE)
+
 import argparse
 
 # locally defined agent
